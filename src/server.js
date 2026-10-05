@@ -44,12 +44,13 @@ export function createApp() {
   app.use(express.json({ limit: "10kb" }));
   app.use(morgan("combined"));
 
-  app.get("/health", (_req, res) =>
+  const healthHandler = (_req, res) =>
     sendSuccess(res, {
       status: "ok",
       database: getDbStatus(),
-    }),
-  );
+    });
+  app.get("/health", healthHandler);
+  app.get("/api/health", healthHandler);
 
   app.use(
     "/api/auth",
