@@ -1,13 +1,23 @@
-import { validationResult } from "express-validator";
-import { AppError } from "../utils/app-error.js";
+// FILE: src/middleware/validate.middleware.js
+// ============================================
+// CORRECTED VERSION - exports validateRequest (not handleValidationErrors)
 
-export function handleValidationErrors(req, _res, next) {
+import { validationResult } from "express-validator";
+import { sendError } from "../utils/response.js";
+
+export function validateRequest(req, res, next) {
   const errors = validationResult(req);
 
   if (!errors.isEmpty()) {
-    throw new AppError("Validation error", 400, {
-      errors: errors.array(),
-    });
+    // Strip the submitted `value` from each error — avoids leaking large/sensitive
+    // user input back in the response and keeps the payload small.
+    const details = errors.array().map(({ type, msg, path, location }) => ({
+      type,
+      msg,
+      path,
+      location,
+    }));
+    return sendError(res, "Validation failed", 400, details);
   }
 
   next();
