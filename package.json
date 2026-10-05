@@ -1,7 +1,7 @@
 {
   "name": "slot-booking-backend",
   "version": "1.0.0",
-  "description": "Slot booking backend API",
+  "description": "Slot booking backend API with MongoDB, Express, and JWT authentication",
   "type": "module",
   "main": "src/server.js",
   "scripts": {
@@ -9,9 +9,12 @@
     "start": "node src/server.js",
     "smtp:verify": "node scripts/verify-smtp.mjs"
   },
-  "keywords": [],
+  "keywords": ["booking", "slots", "appointments", "api"],
   "author": "",
   "license": "ISC",
+  "engines": {
+    "node": ">=18.0.0"
+  },
   "dependencies": {
     "bcryptjs": "^3.0.3",
     "compression": "^1.8.1",

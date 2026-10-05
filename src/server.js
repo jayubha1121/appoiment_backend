@@ -1,12 +1,16 @@
+// FILE: src/server.js
+// LOCATION: Backend root folder
+// ============================================
+
 import dotenv from "dotenv";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import crypto from "node:crypto";  // ✅ ADD THIS - Import crypto at top level!
+import crypto from "node:crypto";  // ✅ CRITICAL: Import crypto first!
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-// Ensure `.env` is loaded from the backend folder even if the process is started elsewhere.
+// Ensure `.env` is loaded from the backend folder
 dotenv.config({
   path: path.resolve(__dirname, "..", ".env"),
   override: process.env.NODE_ENV !== "test",
@@ -43,10 +47,11 @@ export function createApp() {
     );
   }
 
-  // Always trust the first proxy hop.
+  // Always trust the first proxy hop (Railway sets X-Forwarded-For)
   app.set("trust proxy", 1);
   app.use("/railway-log-checker", railwayLogRouter);
 
+  // Security & Compression
   app.use(helmet());
   app.use(compression());
   
@@ -62,6 +67,7 @@ export function createApp() {
   app.use(express.json({ limit: "10kb" }));
   app.use(morgan("combined"));
 
+  // Health check endpoint
   app.get("/health", (_req, res) =>
     sendSuccess(res, {
       status: "ok",
@@ -69,6 +75,7 @@ export function createApp() {
     }),
   );
 
+  // API routes
   app.use(
     "/api/auth",
     publicApiRateLimit,
@@ -76,6 +83,8 @@ export function createApp() {
     authRouter,
   );
   app.use("/api", publicApiRateLimit, requireDatabaseConnection, apiRouter);
+  
+  // Error handling
   app.use(errorMiddleware);
 
   return app;
@@ -104,6 +113,7 @@ async function bootstrap() {
     },
   });
 
+  // Schedule cron jobs
   scheduleAllCronJobs();
 }
 
