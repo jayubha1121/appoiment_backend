@@ -7,10 +7,10 @@ import "../railway-log-checker/logCapture.js";
 // Ensure `.env` is loaded from the backend folder even if the process is started elsewhere.
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
-// Railway/deployment variables take precedence over values in the local `.env`.
+// In tests, Jest sets process.env first; don't override it with `.env`.
 dotenv.config({
   path: path.resolve(__dirname, "..", ".env"),
-  override: false,
+  override: process.env.NODE_ENV !== "test",
 });
 
 import compression from "compression";
@@ -18,7 +18,7 @@ import cors from "cors";
 import express from "express";
 import helmet from "helmet";
 import morgan from "morgan";
-import { connectDb, connectDbWithRetry, getDbStatus } from "./config/db.js";
+import { connectDbWithRetry, getDbStatus } from "./config/db.js";
 import { requireDatabaseConnection } from "./middleware/db.middleware.js";
 import { errorMiddleware } from "./middleware/error.middleware.js";
 import { publicApiRateLimit } from "./middleware/rateLimit.middleware.js";
@@ -29,7 +29,16 @@ import { scheduleAllCronJobs } from "./main/cron/index.js";
 
 export function createApp() {
   const app = express();
-  const frontendUrl = process.env.FRONTEND_URL
+  
+  // ✅ FIX 1: Proper FRONTEND_URL handling
+  const frontendUrl = process.env.FRONTEND_URL;
+  
+  if (!frontendUrl) {
+    logger.warn(
+      "⚠️  FRONTEND_URL is not set. CORS will allow all origins. " +
+      "This is fine for development but NOT SAFE for production!"
+    );
+  }
 
   // Always trust the first proxy hop.
   // Railway (and all cloud platforms) route traffic through a reverse proxy
@@ -40,17 +49,29 @@ export function createApp() {
 
   app.use(helmet());
   app.use(compression());
-  app.use(cors({ origin: frontendUrl }));
+  
+  // ✅ FIX 2: CORS configuration with fallback
+  const corsOptions = {
+    origin: frontendUrl || "*",  // Allow all if not configured, but prefer specific domain
+    credentials: frontendUrl ? true : false,  // Only enable credentials if origin is specific
+    methods: ["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"],
+    allowedHeaders: ["Content-Type", "Authorization"],
+  };
+  
+  if (frontendUrl) {
+    logger.info(`CORS enabled for: ${frontendUrl}`);
+  }
+  
+  app.use(cors(corsOptions));
   app.use(express.json({ limit: "10kb" }));
   app.use(morgan("combined"));
 
-  const healthHandler = (_req, res) =>
+  app.get("/health", (_req, res) =>
     sendSuccess(res, {
       status: "ok",
       database: getDbStatus(),
-    });
-  app.get("/health", healthHandler);
-  app.get("/api/health", healthHandler);
+    }),
+  );
 
   app.use(
     "/api/auth",
@@ -69,53 +90,33 @@ const isTest = process.env.NODE_ENV === "test";
 async function bootstrap() {
   const app = createApp();
   const port = Number(process.env.PORT ?? 8080);
-  let isConnected = false;
-
-  try {
-    isConnected = await connectDb();
-  } catch (error) {
-    const message = error instanceof Error ? error.message : "";
-    if (
-      message === "MONGODB_URI environment variable is missing" ||
-      message.startsWith("MONGODB_URI must be a valid ")
-    ) {
-      logger.error(message, { readyState: getDbStatus().readyState });
-    } else {
-      logger.error(
-        "Initial MongoDB connection attempt failed",
-        error instanceof Error ? error.name : "UnknownError",
-        { readyState: getDbStatus().readyState },
-      );
-    }
-  }
 
   app.listen(port, () => {
-    logger.info(`Server running on port ${port}`);
+    logger.info(`✅ Server running on port ${port}`);
+    
+    // ✅ FIX 3: Log environment configuration status
+    logger.info(`Environment: ${process.env.NODE_ENV || "development"}`);
+    logger.info(`Frontend URL: ${process.env.FRONTEND_URL || "NOT SET (using wildcard)"}`);
+    logger.info(`MongoDB URI: ${process.env.MONGODB_URI ? "✅ Configured" : "❌ NOT SET"}`);
+    logger.info(`Log Access Token: ${process.env.LOG_ACCESS_TOKEN ? "✅ Configured" : "❌ NOT SET"}`);
   });
 
-  if (isConnected) {
-    scheduleAllCronJobs();
-  } else {
-    logger.warn(
-      "MongoDB is unavailable; database-backed API routes will return 503 while connection retries continue",
-      getDbStatus(),
-    );
-    void connectDbWithRetry()
-      .then((connected) => {
-        if (connected) scheduleAllCronJobs();
-      })
-      .catch((error) => {
-        logger.error(
-          "MongoDB reconnection supervisor stopped unexpectedly",
-          error instanceof Error ? error.name : "UnknownError",
-        );
-      });
-  }
+  // ✅ FIX 4: Better error handling for DB connection
+  await connectDbWithRetry({
+    onRetry: (error) => {
+      logger.error(
+        "MongoDB unavailable. The server is running, but database-backed API routes will return 503 until the database connects.",
+        error instanceof Error ? error.name : "UnknownError",
+      );
+    },
+  });
+
+  scheduleAllCronJobs();
 }
 
 if (!isTest) {
   bootstrap().catch((error) => {
-    console.error("Failed to bootstrap server", error);
+    console.error("❌ Failed to bootstrap server", error);
     process.exit(1);
   });
 }
