@@ -7,10 +7,10 @@ import "../railway-log-checker/logCapture.js";
 // Ensure `.env` is loaded from the backend folder even if the process is started elsewhere.
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
-// Deployment-provided variables take precedence over local `.env` values.
+// In tests, Jest sets process.env first; don't override it with `.env`.
 dotenv.config({
   path: path.resolve(__dirname, "..", ".env"),
-  override: false,
+  override: process.env.NODE_ENV !== "test",
 });
 
 import compression from "compression";
@@ -44,13 +44,12 @@ export function createApp() {
   app.use(express.json({ limit: "10kb" }));
   app.use(morgan("combined"));
 
-  const healthHandler = (_req, res) =>
+  app.get("/health", (_req, res) =>
     sendSuccess(res, {
       status: "ok",
       database: getDbStatus(),
-    });
-  app.get("/health", healthHandler);
-  app.get("/api/health", healthHandler);
+    }),
+  );
 
   app.use(
     "/api/auth",
@@ -73,16 +72,16 @@ async function bootstrap() {
   app.listen(port, () => {
     logger.info(`Server running on port ${port}`);
   });
-  void connectDbWithRetry()
-    .then((connected) => {
-      if (connected) scheduleAllCronJobs();
-    })
-    .catch((error) => {
+  await connectDbWithRetry({
+    onRetry: (error) => {
       logger.error(
-        "MongoDB connection supervisor stopped unexpectedly",
-        error?.name ?? "UnknownError",
+        "MongoDB unavailable. The server is running, but database-backed API routes will return 503 until the database connects.",
+        error instanceof Error ? error.name : "UnknownError",
       );
-    });
+    },
+  });
+
+  scheduleAllCronJobs();
 }
 
 if (!isTest) {
