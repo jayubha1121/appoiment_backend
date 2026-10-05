@@ -1,182 +1,73 @@
 import mongoose from "mongoose";
 import { logger } from "../utils/logger.js";
 
-const CONNECTION_OPTIONS = {
-  serverSelectionTimeoutMS: 10_000,
-  connectTimeoutMS: 10_000,
-};
+let isDbConnected = false;
 
-let connectionPromise;
-let disconnectPromise;
-let retryPromise;
-let activeUri;
+function ensureRetryWritesDisabled(uri) {
+  const raw = String(uri ?? "").trim();
+  if (!raw) return raw;
 
-function safeErrorDetails(error, uri = activeUri ?? process.env.MONGODB_URI) {
-  let message = error instanceof Error ? error.message : String(error);
-
-  if (uri) {
-    message = message.replaceAll(uri, "[REDACTED_MONGODB_URI]");
-
-    const authority = uri.match(/^mongodb(?:\+srv)?:\/\/([^/?#]*)/i)?.[1];
-    const credentialsEnd = authority?.lastIndexOf("@") ?? -1;
-    if (authority && credentialsEnd >= 0) {
-      const credentials = authority.slice(0, credentialsEnd);
-      const [username, password] = credentials.split(":", 2);
-      const valuesToRedact = [
-        credentials,
-        decodeURIComponentSafely(credentials),
-        username,
-        decodeURIComponentSafely(username),
-        password,
-        decodeURIComponentSafely(password ?? ""),
-      ];
-      for (const value of valuesToRedact) {
-        if (value) message = message.replaceAll(value, "[REDACTED]");
-      }
-    }
+  // If URI already contains retryWrites, force it to false.
+  if (/retrywrites\s*=/i.test(raw)) {
+    return raw.replace(/([?&])retrywrites=[^&]*/gi, "$1retryWrites=false");
   }
 
-  message = message.replace(
-    /mongodb(?:\+srv)?:\/\/[^\s"'<>]+/gi,
-    "[REDACTED_MONGODB_URI]",
-  );
-  message = message.replace(
-    /((?:password|passwd|pwd|token|access_token|secret)=)[^&\s]+/gi,
-    "$1[REDACTED]",
-  );
-
-  return {
-    name: error?.name ?? "UnknownError",
-    message,
-    code: error?.code,
-    codeName: error?.codeName,
-    readyState: mongoose.connection.readyState,
-  };
+  // Works for both mongodb:// and mongodb+srv:// connection strings.
+  return raw.includes("?") ? `${raw}&retryWrites=false` : `${raw}?retryWrites=false`;
 }
-
-function decodeURIComponentSafely(value) {
-  try {
-    return decodeURIComponent(value);
-  } catch {
-    return value;
-  }
-}
-
-function logConnectionError(
-  message,
-  error,
-  uri = activeUri ?? process.env.MONGODB_URI,
-) {
-  logger.error(message, safeErrorDetails(error, uri));
-}
-
-function validateMongoUri(uri) {
-  if (typeof uri !== "string" || uri.trim() === "") {
-    throw new Error("MONGODB_URI environment variable is missing");
-  }
-  if (uri.trim() !== uri || !/^mongodb(?:\+srv)?:\/\//i.test(uri)) {
-    throw new Error(
-      "MONGODB_URI must be a valid mongodb:// or mongodb+srv:// connection string",
-    );
-  }
-}
-
-mongoose.connection.on("connected", () => {
-  logger.info("MongoDB connected successfully");
-});
-
-mongoose.connection.on("error", (error) => {
-  logConnectionError("MongoDB connection error", error);
-});
-
-mongoose.connection.on("disconnected", () => {
-  logger.warn("MongoDB disconnected", {
-    readyState: mongoose.connection.readyState,
-  });
-});
 
 export async function connectDb(uri = process.env.MONGODB_URI) {
-  validateMongoUri(uri);
-
-  if (disconnectPromise) await disconnectPromise;
-  if (mongoose.connection.readyState === 1) return true;
-  if (connectionPromise) return connectionPromise;
-  if (mongoose.connection.readyState === 2) {
-    await mongoose.connection.asPromise();
-    return true;
-  }
-  if (mongoose.connection.readyState === 3) {
-    await mongoose.disconnect();
+  if (!uri) {
+    throw new Error("MONGODB_URI is not configured.");
   }
 
   mongoose.set("strictQuery", true);
-  activeUri = uri;
-  connectionPromise = mongoose
-    .connect(uri, CONNECTION_OPTIONS)
-    .then(() => true)
-    .finally(() => {
-      connectionPromise = undefined;
-    });
-
-  return connectionPromise;
+  const safeUri = ensureRetryWritesDisabled(uri);
+  await mongoose.connect(safeUri, {
+    // Some managed/shared Mongo deployments don't support retryable writes.
+    // Force-disable at the driver option level too.
+    retryWrites: false,
+  });
+  isDbConnected = true;
+  logger.info("MongoDB connected");
 }
 
 export async function disconnectDb() {
-  if (disconnectPromise) return disconnectPromise;
-
-  disconnectPromise = mongoose.disconnect().finally(() => {
-    disconnectPromise = undefined;
-  });
-  return disconnectPromise;
+  await mongoose.disconnect();
+  isDbConnected = false;
 }
 
 export function getDbStatus() {
-  const readyState = mongoose.connection.readyState;
   return {
-    isConnected: readyState === 1,
-    readyState,
+    isConnected: isDbConnected && mongoose.connection.readyState === 1,
+    readyState: mongoose.connection.readyState,
   };
 }
 
-async function runConnectionRetries({
+export async function connectDbWithRetry({
   uri,
-  retryDelayMs = 1000,
-  maxRetryDelayMs = 30_000,
+  retryDelayMs = 5000,
+  onRetry,
 } = {}) {
   const resolvedUri = uri ?? process.env.MONGODB_URI;
 
-  if (typeof resolvedUri !== "string" || resolvedUri.trim() === "") {
-    logger.error("MONGODB_URI environment variable is missing", {
-      readyState: mongoose.connection.readyState,
-    });
-    return false;
-  }
-  try {
-    validateMongoUri(resolvedUri);
-  } catch (error) {
-    logConnectionError("Invalid MONGODB_URI configuration", error, resolvedUri);
-    return false;
-  }
-
-  let retryDelay = retryDelayMs;
   while (true) {
     try {
       await connectDb(resolvedUri);
       return true;
     } catch (error) {
-      logConnectionError("MongoDB connection failed; retrying", error, resolvedUri);
-      if (error?.name === "MongoParseError") return false;
-      await new Promise((resolve) => setTimeout(resolve, retryDelay));
-      retryDelay = Math.min(retryDelay * 2, maxRetryDelayMs);
+      isDbConnected = false;
+
+      if (typeof onRetry === "function") {
+        onRetry(error);
+      } else {
+        logger.error(
+          "MongoDB connection failed. Retrying...",
+          error instanceof Error ? error.name : "UnknownError",
+        );
+      }
+
+      await new Promise((resolve) => setTimeout(resolve, retryDelayMs));
     }
   }
-}
-
-export function connectDbWithRetry(options = {}) {
-  if (retryPromise) return retryPromise;
-
-  retryPromise = runConnectionRetries(options).finally(() => {
-    retryPromise = undefined;
-  });
-  return retryPromise;
 }
