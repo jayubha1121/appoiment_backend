@@ -1,17 +1,20 @@
 import dotenv from "dotenv";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import railwayLogRouter from "../railway-log-checker/router.js";
-import "../railway-log-checker/logCapture.js";
+import crypto from "node:crypto";  // ✅ ADD THIS - Import crypto at top level!
 
-// Ensure `.env` is loaded from the backend folder even if the process is started elsewhere.
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
-// In tests, Jest sets process.env first; don't override it with `.env`.
+
+// Ensure `.env` is loaded from the backend folder even if the process is started elsewhere.
 dotenv.config({
   path: path.resolve(__dirname, "..", ".env"),
   override: process.env.NODE_ENV !== "test",
 });
+
+// ✅ NOW import railway-log-checker after crypto is available
+import railwayLogRouter from "../railway-log-checker/router.js";
+import "../railway-log-checker/logCapture.js";
 
 import compression from "compression";
 import cors from "cors";
@@ -30,37 +33,30 @@ import { scheduleAllCronJobs } from "./main/cron/index.js";
 export function createApp() {
   const app = express();
   
-  // ✅ FIX 1: Proper FRONTEND_URL handling
+  // Environment configuration
   const frontendUrl = process.env.FRONTEND_URL;
   
-  if (!frontendUrl) {
+  if (!frontendUrl && process.env.NODE_ENV === "production") {
     logger.warn(
-      "⚠️  FRONTEND_URL is not set. CORS will allow all origins. " +
-      "This is fine for development but NOT SAFE for production!"
+      "⚠️  FRONTEND_URL is not set in production. CORS will allow all origins. " +
+      "This is a security risk! Set FRONTEND_URL in Railway Variables."
     );
   }
 
   // Always trust the first proxy hop.
-  // Railway (and all cloud platforms) route traffic through a reverse proxy
-  // that sets X-Forwarded-For. Without this, express-rate-limit throws
-  // ERR_ERL_UNEXPECTED_X_FORWARDED_FOR and bookings return 500.
   app.set("trust proxy", 1);
   app.use("/railway-log-checker", railwayLogRouter);
 
   app.use(helmet());
   app.use(compression());
   
-  // ✅ FIX 2: CORS configuration with fallback
+  // CORS configuration
   const corsOptions = {
-    origin: frontendUrl || "*",  // Allow all if not configured, but prefer specific domain
-    credentials: frontendUrl ? true : false,  // Only enable credentials if origin is specific
+    origin: frontendUrl || "*",
+    credentials: !!frontendUrl,
     methods: ["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"],
     allowedHeaders: ["Content-Type", "Authorization"],
   };
-  
-  if (frontendUrl) {
-    logger.info(`CORS enabled for: ${frontendUrl}`);
-  }
   
   app.use(cors(corsOptions));
   app.use(express.json({ limit: "10kb" }));
@@ -93,15 +89,12 @@ async function bootstrap() {
 
   app.listen(port, () => {
     logger.info(`✅ Server running on port ${port}`);
-    
-    // ✅ FIX 3: Log environment configuration status
     logger.info(`Environment: ${process.env.NODE_ENV || "development"}`);
     logger.info(`Frontend URL: ${process.env.FRONTEND_URL || "NOT SET (using wildcard)"}`);
-    logger.info(`MongoDB URI: ${process.env.MONGODB_URI ? "✅ Configured" : "❌ NOT SET"}`);
-    logger.info(`Log Access Token: ${process.env.LOG_ACCESS_TOKEN ? "✅ Configured" : "❌ NOT SET"}`);
+    logger.info(`Database: ${process.env.MONGODB_URI ? "✅ Configured" : "❌ NOT SET"}`);
   });
 
-  // ✅ FIX 4: Better error handling for DB connection
+  // Connect to database with retry
   await connectDbWithRetry({
     onRetry: (error) => {
       logger.error(
