@@ -7,10 +7,10 @@ import "../railway-log-checker/logCapture.js";
 // Ensure `.env` is loaded from the backend folder even if the process is started elsewhere.
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
-// In tests, Jest sets process.env first; don't override it with `.env`.
+// Railway/deployment variables take precedence over values in the local `.env`.
 dotenv.config({
   path: path.resolve(__dirname, "..", ".env"),
-  override: process.env.NODE_ENV !== "test",
+  override: false,
 });
 
 import compression from "compression";
@@ -18,7 +18,7 @@ import cors from "cors";
 import express from "express";
 import helmet from "helmet";
 import morgan from "morgan";
-import { connectDbWithRetry, getDbStatus } from "./config/db.js";
+import { connectDb, connectDbWithRetry, getDbStatus } from "./config/db.js";
 import { requireDatabaseConnection } from "./middleware/db.middleware.js";
 import { errorMiddleware } from "./middleware/error.middleware.js";
 import { publicApiRateLimit } from "./middleware/rateLimit.middleware.js";
@@ -44,12 +44,13 @@ export function createApp() {
   app.use(express.json({ limit: "10kb" }));
   app.use(morgan("combined"));
 
-  app.get("/health", (_req, res) =>
+  const healthHandler = (_req, res) =>
     sendSuccess(res, {
       status: "ok",
       database: getDbStatus(),
-    }),
-  );
+    });
+  app.get("/health", healthHandler);
+  app.get("/api/health", healthHandler);
 
   app.use(
     "/api/auth",
@@ -68,20 +69,48 @@ const isTest = process.env.NODE_ENV === "test";
 async function bootstrap() {
   const app = createApp();
   const port = Number(process.env.PORT ?? 8080);
+  let isConnected = false;
+
+  try {
+    isConnected = await connectDb();
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "";
+    if (
+      message === "MONGODB_URI environment variable is missing" ||
+      message.startsWith("MONGODB_URI must be a valid ")
+    ) {
+      logger.error(message, { readyState: getDbStatus().readyState });
+    } else {
+      logger.error(
+        "Initial MongoDB connection attempt failed",
+        error instanceof Error ? error.name : "UnknownError",
+        { readyState: getDbStatus().readyState },
+      );
+    }
+  }
 
   app.listen(port, () => {
     logger.info(`Server running on port ${port}`);
   });
-  await connectDbWithRetry({
-    onRetry: (error) => {
-      logger.error(
-        "MongoDB unavailable. The server is running, but database-backed API routes will return 503 until the database connects.",
-        error instanceof Error ? error.name : "UnknownError",
-      );
-    },
-  });
 
-  scheduleAllCronJobs();
+  if (isConnected) {
+    scheduleAllCronJobs();
+  } else {
+    logger.warn(
+      "MongoDB is unavailable; database-backed API routes will return 503 while connection retries continue",
+      getDbStatus(),
+    );
+    void connectDbWithRetry()
+      .then((connected) => {
+        if (connected) scheduleAllCronJobs();
+      })
+      .catch((error) => {
+        logger.error(
+          "MongoDB reconnection supervisor stopped unexpectedly",
+          error instanceof Error ? error.name : "UnknownError",
+        );
+      });
+  }
 }
 
 if (!isTest) {
