@@ -72,16 +72,16 @@ async function bootstrap() {
   app.listen(port, () => {
     logger.info(`Server running on port ${port}`);
   });
-  await connectDbWithRetry({
-    onRetry: (error) => {
+  void connectDbWithRetry()
+    .then((connected) => {
+      if (connected) scheduleAllCronJobs();
+    })
+    .catch((error) => {
       logger.error(
-        "MongoDB unavailable. The server is running, but database-backed API routes will return 503 until the database connects.",
-        error instanceof Error ? error.name : "UnknownError",
+        "MongoDB connection supervisor stopped unexpectedly",
+        error?.name ?? "UnknownError",
       );
-    },
-  });
-
-  scheduleAllCronJobs();
+    });
 }
 
 if (!isTest) {
